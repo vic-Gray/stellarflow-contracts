@@ -51,6 +51,7 @@ use crate::nonce::{consume_nonce, get_nonce};
 pub mod auth;
 pub mod consensus;
 pub mod math;
+pub mod models;
 pub mod staking_tiers;
 pub mod governance;
 use crate::governance::{verify_staged_delay, StagedUpgrade};
@@ -98,6 +99,8 @@ pub enum ContractError {
     NoPendingOwner = 25,
     /// Incoming tracking sequence is less than or equal to the active stored checkpoint value.
     StaleSequence = 26,
+    /// Current ledger has not advanced by at least 3 blocks since relayer's last submission.
+    LedgerGapNotSatisfied = 27,
 }
 
 // Contract state keys
@@ -205,6 +208,7 @@ impl TimeLockedUpgradeContract {
     pub fn stake_and_register(env: Env, node: Address, amount: u64) -> Result<StakeRecord, ContractError> {
         if amount == 0 { return Err(ContractError::InvalidStakeAmount); }
         node.require_auth();
+        Self::_enforce_ledger_gap(&env, &node)?;
         let mut stakes: Map<Address, u64> = env.storage().instance().get(&STAKE_REGISTRY_KEY).unwrap_or_else(|| Map::new(&env));
         if stakes.contains_key(node.clone()) { return Err(ContractError::AlreadyRegistered); }
         let total: u64 = env.storage().instance().get(&TOTAL_STAKED_KEY).unwrap_or(0u64);
@@ -213,6 +217,7 @@ impl TimeLockedUpgradeContract {
         env.storage().instance().set(&STAKE_REGISTRY_KEY, &stakes);
         env.storage().instance().set(&TOTAL_STAKED_KEY, &new_total);
         Self::_record_heartbeat(&env, symbol_short!("STAKE"));
+        crate::models::record_ledger_gap(&env, &node);
         Ok(StakeRecord { node, amount, registered_at: env.ledger().timestamp() })
     }
 
@@ -377,7 +382,7 @@ impl TimeLockedUpgradeContract {
     ) -> Result<(), ContractError> {
         node.require_auth();
         check_bond_capacity(&env, &node, &pool)?;
-        Self::_record_heartbeat(&env, pool);
+        Self::_record_heartbeat_with_gap_check(&env, pool, &node)?;
         Ok(())
     }
 
@@ -385,7 +390,7 @@ impl TimeLockedUpgradeContract {
         let data = Self::get_data(&env)?;
         if data.admin != updater { return Err(ContractError::NotAdmin); }
         updater.require_auth();
-        Self::_record_heartbeat(&env, asset);
+        Self::_record_heartbeat_with_gap_check(&env, asset, &updater)?;
         Ok(())
     }
 
@@ -546,7 +551,7 @@ impl TimeLockedUpgradeContract {
 
         env.storage().instance().set(&STAKE_REGISTRY_KEY, &stakes);
         env.storage().instance().set(&TOTAL_STAKED_KEY, &new_total);
-        Self::_record_heartbeat(&env, asset.clone());
+        Self::_record_heartbeat_with_gap_check(&env, asset.clone(), &node)?;
 
         Ok(FeedStakeRecord {
             node,
@@ -655,12 +660,22 @@ impl TimeLockedUpgradeContract {
         timestamps.set(asset, env.ledger().timestamp());
         env.storage().temporary().set(&HEARTBEAT_KEY, &timestamps);
         
-        // Set TTL to ensure entries expire naturally after validation window
         env.storage().temporary().extend_ttl(
             &HEARTBEAT_KEY,
             HEARTBEAT_TTL_THRESHOLD,
             HEARTBEAT_TTL_LEDGERS,
         );
+    }
+    
+    fn _enforce_ledger_gap(env: &Env, relayer: &Address) -> Result<(), ContractError> {
+        crate::models::verify_ledger_gap(env, relayer)
+    }
+    
+    fn _record_heartbeat_with_gap_check(env: &Env, asset: AssetId, updater: &Address) -> Result<(), ContractError> {
+        Self::_enforce_ledger_gap(env, updater)?;
+        Self::_record_heartbeat(env, asset);
+        crate::models::record_ledger_gap(env, updater);
+        Ok(())
     }
 
     fn _get_interval(env: &Env) -> u64 {
