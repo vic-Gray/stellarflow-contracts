@@ -79,12 +79,7 @@ pub enum ContractError {
     ThresholdNotReached = 17,
     SignatureExpired = 18,
     InvalidSaltSignature = 19,
-    /// Stake amount is below the tier minimum for the target currency feed.
-    InsufficientStakeForTier = 20,
-    /// Staking tier configuration is invalid or non-monotonic.
-    InvalidTierConfig = 21,
-    /// Node is already registered for this currency feed.
-    FeedAlreadyRegistered = 22,
+    FeeCeilingExceeded = 20,
 }
 
 // Contract state keys
@@ -100,6 +95,7 @@ const SIGNERS_KEY: Symbol = symbol_short!("SIGNERS");
 const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
 const NODE_PROFILES_KEY: Symbol = symbol_short!("NODES");
 const PLATFORM_CAPITAL_KEY: Symbol = symbol_short!("CAPITAL");
+const MAX_FEE_CEILING: u64 = 1_000_000_000;
 const CONSENSUS_CACHE_KEY: Symbol = symbol_short!("CACHE");
 const RELAYER_TTL_THRESHOLD: u32 = 5_000;
 
@@ -126,6 +122,7 @@ pub struct PendingUpgrade {
 pub struct ContractData {
     pub admin: Address,
     pub value: u64,
+    pub max_fee_ceiling: u64,
 }
 
 #[contracttype]
@@ -186,7 +183,7 @@ impl TimeLockedUpgradeContract {
             return Err(ContractError::AlreadyInitialized);
         }
         admin.require_auth();
-        let data = ContractData { admin: admin.clone(), value: 0 };
+        let data = ContractData { admin: admin.clone(), value: 0, max_fee_ceiling: MAX_FEE_CEILING };
         env.storage().instance().set(&DATA_KEY, &data);
         Ok(())
     }
@@ -317,6 +314,7 @@ impl TimeLockedUpgradeContract {
         if env.ledger().timestamp() > sig_expires_at { return Err(ContractError::SignatureExpired); }
         let mut data = Self::get_data(env.clone())?;
         if data.admin != caller { return Err(ContractError::NotAdmin); }
+        if new_value > data.max_fee_ceiling { return Err(ContractError::FeeCeilingExceeded); }
         caller.require_auth();
         consume_nonce(&env, &caller, nonce, salt, signature)?;
         data.value = new_value;
@@ -598,6 +596,16 @@ impl TimeLockedUpgradeContract {
             env.storage().instance().set(&SIGNERS_KEY, &signers);
         }
         Ok(())
+    }
+
+    // --- Admin Ownership Transfer (Issue #429) ---
+
+    pub fn propose_ownership_transfer(env: Env, current_admin: Address, nominee: Address) -> Result<(), ContractError> {
+        admin::propose_ownership_transfer(&env, current_admin, nominee)
+    }
+
+    pub fn claim_ownership(env: Env, claimer: Address) -> Result<(), ContractError> {
+        admin::claim_ownership(&env, claimer)
     }
 
     // --- Private Helpers ---
